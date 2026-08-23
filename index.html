@@ -3,105 +3,313 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Voice Probe</title>
+<title>Talk to Syd</title>
 <style>
   :root { color-scheme: light dark; }
-  body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 24px;
-         display: flex; flex-direction: column; align-items: center; gap: 18px;
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 20px;
+         display: flex; flex-direction: column; align-items: center; gap: 14px;
          background: #101418; color: #e8edf2; min-height: 100vh; box-sizing: border-box; }
-  h1 { font-size: 20px; margin: 8px 0 0; }
-  #status { font-size: 15px; color: #9fb0c0; text-align: center; min-height: 40px;
+  h1 { font-size: 19px; margin: 4px 0 0; }
+  #status { font-size: 14px; color: #9fb0c0; text-align: center; min-height: 36px;
             max-width: 340px; word-break: break-word; }
-  button { font-size: 17px; padding: 14px 28px; border-radius: 999px; border: none;
+  #chan { font-size: 12px; color: #6d7f90; }
+  button { font-size: 17px; padding: 13px 26px; border-radius: 999px; border: none;
            background: #2f6fed; color: #fff; }
-  button:disabled { opacity: .4; }
+  button:disabled { opacity: .35; }
   #rec.live { background: #d64545; }
-  canvas { width: 280px; height: 48px; background: #1a2027; border-radius: 8px; }
-  audio { width: 280px; }
+  #out { width: 100%; max-width: 420px; min-height: 130px; background: #1a2027;
+         border-radius: 10px; padding: 12px; font-size: 16px; line-height: 1.45;
+         box-sizing: border-box; white-space: pre-wrap; }
+  #out .part { color: #8fa3b8; }
+  .row { display: flex; gap: 10px; }
 </style>
 </head>
 <body>
-<h1>Voice Probe</h1>
-<p id="status">Tap Record. Your phone should ask to allow the microphone.</p>
+<h1>Talk to Syd</h1>
+<p id="chan">channel: checking&#8230;</p>
+<p id="status">Tap Record and speak. Your words appear below as you talk.</p>
 <button id="rec" type="button">&#127908; Record</button>
-<canvas id="meter" width="280" height="48"></canvas>
-<audio id="play" controls></audio>
+<div id="out"></div>
+<div class="row">
+  <button id="send" type="button" disabled>Done &#8212; send to Syd</button>
+  <button id="copy" type="button" disabled>Copy</button>
+</div>
 <script>
 (function () {
+  'use strict';
   var st = document.getElementById('status');
+  var chanEl = document.getElementById('chan');
   var btn = document.getElementById('rec');
-  var player = document.getElementById('play');
-  var rec = null, stream = null, chunks = [];
+  var out = document.getElementById('out');
+  var sendBtn = document.getElementById('send');
+  var copyBtn = document.getElementById('copy');
   function say(s) { st.textContent = s; }
   function fail(where, e) { say('FAILED at ' + where + ': ' + (e && e.message ? e.message : e)); }
 
-  // decoration only — the core chain never depends on this (card: AM5)
-  function startMeter(ms) {
-    try {
-      var AC = window.AudioContext || window.webkitAudioContext;
-      var ctx = new AC();                     // created inside the tap gesture
-      if (ctx.state === 'suspended') ctx.resume();
-      var src = ctx.createMediaStreamSource(ms);
-      var an = ctx.createAnalyser(); an.fftSize = 256;
-      src.connect(an);
-      var cv = document.getElementById('meter'), g = cv.getContext('2d');
-      var buf = new Uint8Array(an.frequencyBinCount);
-      (function draw() {
-        if (!stream) return;
-        an.getByteFrequencyData(buf);
-        var v = 0; for (var i = 0; i < buf.length; i++) v = Math.max(v, buf[i]);
-        g.clearRect(0, 0, cv.width, cv.height);
-        g.fillStyle = '#2f6fed';
-        g.fillRect(0, cv.height - (v / 255) * cv.height, cv.width, (v / 255) * cv.height);
-        requestAnimationFrame(draw);
-      })();
-    } catch (e) { /* meter is decoration; the proof does not care */ }
+  // fragment: w=<presigned wss> & o=<app origin> & t=1 (tone smoke), all URI-encoded
+  var frag = {};
+  location.hash.slice(1).split('&').forEach(function (kv) {
+    var i = kv.indexOf('=');
+    if (i > 0) frag[kv.slice(0, i)] = decodeURIComponent(kv.slice(i + 1));
+  });
+  var WSS = frag.w || '';
+  var APP_ORIGIN = frag.o || '';
+  var TONE = frag.t === '1';
+  var originOk = /^https:\/\//.test(APP_ORIGIN) &&
+    (/\.googleusercontent\.com$/.test(new URL(APP_ORIGIN || 'https://x.invalid').host) ||
+     APP_ORIGIN === 'https://script.google.com');
+  // NOTE (card 230): this allowlist is NOT an app-identity control — any Apps
+  // Script origin passes. The app-side event.origin check is the real gate.
+  var channel = (window.opener != null) && originOk;
+  chanEl.textContent = 'channel: ' + (channel ? 'connected' : 'copy-only');
+
+  var finals = [];   // finalized transcript pieces
+  var partial = '';  // current partial
+  function render() {
+    out.textContent = finals.join(' ');
+    if (partial) {
+      var sp = document.createElement('span');
+      sp.className = 'part';
+      sp.textContent = (finals.length ? ' ' : '') + partial;
+      out.appendChild(sp);
+    }
+    var has = finals.length > 0 || partial;
+    copyBtn.disabled = !has;
+  }
+
+  // ---------- CRC32 (IEEE) ----------
+  var CRC_T = (function () {
+    var t = new Uint32Array(256);
+    for (var n = 0; n < 256; n++) {
+      var c = n;
+      for (var k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      t[n] = c >>> 0;
+    }
+    return t;
+  })();
+  function crc32(bytes, start, end) {
+    var c = 0xFFFFFFFF;
+    for (var i = start; i < end; i++) c = CRC_T[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+  }
+
+  // ---------- eventstream encode ----------
+  var TE = new TextEncoder();
+  function esHeader(name, value) {
+    var nb = TE.encode(name), vb = TE.encode(value);
+    var buf = new Uint8Array(1 + nb.length + 1 + 2 + vb.length);
+    var o = 0;
+    buf[o++] = nb.length; buf.set(nb, o); o += nb.length;
+    buf[o++] = 7; // type: string
+    buf[o++] = (vb.length >> 8) & 0xFF; buf[o++] = vb.length & 0xFF;
+    buf.set(vb, o);
+    return buf;
+  }
+  function esFrame(headers, payload) {
+    var hlen = headers.reduce(function (a, h) { return a + h.length; }, 0);
+    var total = 12 + hlen + payload.length + 4;
+    var buf = new Uint8Array(total);
+    var dv = new DataView(buf.buffer);
+    dv.setUint32(0, total); dv.setUint32(4, hlen);
+    dv.setUint32(8, crc32(buf, 0, 8));
+    var o = 12;
+    headers.forEach(function (h) { buf.set(h, o); o += h.length; });
+    buf.set(payload, o); o += payload.length;
+    dv.setUint32(o, crc32(buf, 0, o));
+    return buf;
+  }
+  function audioEvent(pcmBytes) {
+    return esFrame([
+      esHeader(':message-type', 'event'),
+      esHeader(':event-type', 'AudioEvent'),
+      esHeader(':content-type', 'application/octet-stream')
+    ], pcmBytes);
+  }
+
+  // ---------- eventstream decode ----------
+  function esParse(buf) {
+    var u8 = new Uint8Array(buf), dv = new DataView(buf);
+    var hlen = dv.getUint32(4);
+    var headers = {}, o = 12, hend = 12 + hlen;
+    while (o < hend) {
+      var nl = u8[o++]; var name = new TextDecoder().decode(u8.subarray(o, o + nl)); o += nl;
+      var type = u8[o++];
+      if (type === 7) {
+        var vl = (u8[o] << 8) | u8[o + 1]; o += 2;
+        headers[name] = new TextDecoder().decode(u8.subarray(o, o + vl)); o += vl;
+      } else { break; } // only string headers expected from Transcribe
+    }
+    var payload = u8.subarray(hend, u8.length - 4);
+    return { headers: headers, payload: payload };
+  }
+
+  // ---------- resampler: actual rate -> 16k, fractional linear interpolation ----------
+  function resampleTo16k(f32, srcRate) {
+    var ratio = srcRate / 16000;
+    var n = Math.floor(f32.length / ratio);
+    var pcm = new Int16Array(n);
+    for (var i = 0; i < n; i++) {
+      var pos = i * ratio, i0 = Math.floor(pos), i1 = Math.min(i0 + 1, f32.length - 1);
+      var s = f32[i0] + (f32[i1] - f32[i0]) * (pos - i0);
+      var v = Math.round(s * 32767);
+      pcm[i] = Math.max(-32768, Math.min(32767, v));
+    }
+    return pcm;
+  }
+
+  var ws = null, ctx = null, proc = null, stream = null, running = false;
+  var framesSent = 0, finalized = false, wsOpened = false;
+
+  function wsUrlOk() { return /^wss:\/\/transcribestreaming\./.test(WSS); }
+
+  function handleMessage(ev) {
+    var msg;
+    try { msg = esParse(ev.data); } catch (e) { fail('eventstream parse', e); return; }
+    var mt = msg.headers[':message-type'];
+    if (mt === 'exception') {
+      var detail = '';
+      try { detail = JSON.parse(new TextDecoder().decode(msg.payload)).Message || ''; } catch (e1) {}
+      fail('Transcribe ' + (msg.headers[':exception-type'] || 'exception'), detail.slice(0, 160));
+      stopAll(false);
+      return;
+    }
+    if (msg.headers[':event-type'] !== 'TranscriptEvent') return;
+    var j;
+    try { j = JSON.parse(new TextDecoder().decode(msg.payload)); } catch (e2) { return; }
+    var results = (j.Transcript && j.Transcript.Results) || [];
+    results.forEach(function (r) {
+      var alt = r.Alternatives && r.Alternatives[0];
+      if (!alt) return;
+      if (r.IsPartial) { partial = alt.Transcript || ''; }
+      else { if (alt.Transcript) finals.push(alt.Transcript); partial = ''; }
+    });
+    render();
+  }
+
+  function stopAll(sendEmpty) {
+    running = false;
+    btn.classList.remove('live'); btn.textContent = '🎤 Record';
+    try { if (proc) proc.disconnect(); } catch (e) {}
+    try { if (ctx) ctx.close(); } catch (e) {}
+    if (stream) { stream.getTracks().forEach(function (t) { try { t.stop(); } catch (e) {} }); stream = null; }
+    if (ws && ws.readyState === 1) {
+      if (sendEmpty && !finalized) {
+        finalized = true;
+        try { ws.send(audioEvent(new Uint8Array(0))); } catch (e) {} // finalize flush
+        say('Finishing up…');
+        // Done enables when the final TranscriptEvent lands or the socket closes
+        setTimeout(function () { try { ws.close(); } catch (e) {} }, 2500);
+      } else { try { ws.close(); } catch (e) {} }
+    }
+  }
+
+  function startTonePump() {
+    // #t=1 smoke: 1.5s of 440Hz + 1.5s silence at 16k, 4096-sample frames.
+    var total = 48000, sent = 0;
+    var timer = setInterval(function () {
+      if (!ws || ws.readyState !== 1 || sent >= total) {
+        clearInterval(timer);
+        stopAll(true);
+        return;
+      }
+      var n = Math.min(4096, total - sent);
+      var pcm = new Int16Array(n);
+      for (var i = 0; i < n; i++) {
+        var t = (sent + i) / 16000;
+        pcm[i] = (sent + i < 24000) ? Math.round(Math.sin(2 * Math.PI * 440 * t) * 12000) : 0;
+      }
+      sent += n;
+      ws.send(audioEvent(new Uint8Array(pcm.buffer)));
+      framesSent++;
+      say('tone frames sent: ' + framesSent);
+    }, 250);
+  }
+
+  function begin() {
+    if (!wsUrlOk()) { say('No valid session in the link — open this from Syd’s mic button.'); return; }
+    say(TONE ? 'Tone smoke starting…' : 'Asking for the microphone…');
+    ws = new WebSocket(WSS);
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = function () {
+      wsOpened = true;
+      say(TONE ? 'Connected — streaming tone.' : 'Connected — speak now.');
+      if (TONE) { startTonePump(); return; }
+      navigator.mediaDevices.getUserMedia({ audio: true }).then(function (ms) {
+        stream = ms;
+        try {
+          var AC = window.AudioContext || window.webkitAudioContext;
+          ctx = new AC();
+          if (ctx.state === 'suspended') ctx.resume();
+          var src = ctx.createMediaStreamSource(ms);
+          proc = ctx.createScriptProcessor(4096, 1, 1);
+          proc.onaudioprocess = function (ev2) {
+            if (!running || !ws || ws.readyState !== 1) return;
+            var pcm = resampleTo16k(ev2.inputBuffer.getChannelData(0), ctx.sampleRate);
+            ws.send(audioEvent(new Uint8Array(pcm.buffer)));
+            framesSent++;
+          };
+          src.connect(proc); proc.connect(ctx.destination);
+          running = true;
+          btn.classList.add('live'); btn.textContent = '⏹ Stop';
+          say('Recording — speak, then tap Stop.');
+        } catch (e) { fail('audio pipeline', e); stopAll(false); }
+      }).catch(function (e) {
+        fail('getUserMedia', e);
+        say(st.textContent + ' — If you tapped Don’t Allow: Safari aA menu → Website Settings → Microphone → Allow, then reload.');
+        stopAll(false);
+      });
+    };
+    ws.onmessage = handleMessage;
+    ws.onerror = function () { if (!wsOpened) say('Could not connect (the session may have expired — reopen from Syd).'); };
+    ws.onclose = function (ev3) {
+      if (running) { running = false; btn.classList.remove('live'); btn.textContent = '🎤 Record'; }
+      if (finals.length || partial) {
+        if (partial) { finals.push(partial); partial = ''; render(); }
+        say('Done. Review below, then send or copy.');
+        sendBtn.disabled = !channel;
+        copyBtn.disabled = false;
+      } else if (wsOpened && TONE) {
+        say('Tone smoke complete: opened, ' + framesSent + ' frames sent, clean close ' + ev3.code + '.');
+      } else if (wsOpened) {
+        say('Closed (' + ev3.code + ') with no transcript — try again.');
+      }
+    };
   }
 
   btn.addEventListener('click', function () {
-    if (stream) { // stop
-      try { rec.stop(); } catch (e) {}
-      return;
-    }
-    say('Asking for the microphone…');
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      say('This browser has no getUserMedia. The probe cannot run here.'); return;
-    }
-    navigator.mediaDevices.getUserMedia({ audio: true }).then(function (ms) {
-      stream = ms;
-      // the handback smoke signal fires on SUCCESS, guarded (card: AM3/AM5)
+    if (running) { stopAll(true); sendBtn.disabled = !channel && true; return; }
+    finals = []; partial = ''; framesSent = 0; finalized = false; wsOpened = false;
+    render(); sendBtn.disabled = true; copyBtn.disabled = true;
+    begin();
+  });
+
+  sendBtn.addEventListener('click', function () {
+    var text = finals.join(' ').trim();
+    if (!text) return;
+    if (channel && window.opener) {
       try {
-        if (window.opener) window.opener.postMessage({ ascendVoice: 'mic-proven' }, '*');
-      } catch (e0) {}
-      var mime = '';
-      try {
-        if (window.MediaRecorder) {
-          if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('audio/mp4')) mime = 'audio/mp4';
-          else if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('audio/webm')) mime = 'audio/webm';
-        } else { fail('MediaRecorder', 'not present in this browser'); return; }
-        rec = mime ? new MediaRecorder(ms, { mimeType: mime }) : new MediaRecorder(ms);
-      } catch (e1) { fail('MediaRecorder setup', e1); return; }
-      chunks = [];
-      rec.ondataavailable = function (ev) { if (ev.data && ev.data.size) chunks.push(ev.data); };
-      rec.onstop = function () {
-        try {
-          var type = rec.mimeType || mime || 'audio/mp4';
-          var blob = new Blob(chunks, { type: type });
-          player.src = URL.createObjectURL(blob);
-          say('Recorded ' + Math.round(blob.size / 1024) + ' KB as ' + type +
-              '. Tap Play below to hear it.');
-        } catch (e2) { fail('playback setup', e2); }
-        ms.getTracks().forEach(function (t) { try { t.stop(); } catch (e3) {} });
-        stream = null; btn.classList.remove('live'); btn.textContent = '🎤 Record';
-      };
-      try { rec.start(); } catch (e4) { fail('start', e4); return; }
-      btn.classList.add('live'); btn.textContent = '⏹ Stop';
-      say('Recording (' + (rec.mimeType || mime || 'default') + ')… speak, then tap Stop.');
-      startMeter(ms);
-    }).catch(function (e) {
-      fail('getUserMedia', e);
-      say(st.textContent + ' — If you tapped Don’t Allow: Safari aA menu → Website Settings → Microphone → Allow, then reload.');
-    });
+        window.opener.postMessage({ ascendVoice: 'transcript', text: text }, APP_ORIGIN);
+        say('Sent to Syd.');
+        setTimeout(function () { try { window.close(); } catch (e) {} }, 400);
+        return;
+      } catch (e) { /* fall through to copy advice */ }
+    }
+    say('No channel — use Copy, then paste into Syd.');
+  });
+
+  copyBtn.addEventListener('click', function () {
+    var text = (finals.join(' ') + (partial ? ' ' + partial : '')).trim();
+    if (!text) return;
+    function fallback() {
+      var ta = document.createElement('textarea');
+      ta.value = text; document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); say('Copied — paste it into Syd.'); }
+      catch (e) { say('Copy failed — select the text above by hand.'); }
+      document.body.removeChild(ta);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { say('Copied — paste it into Syd.'); }, fallback);
+    } else { fallback(); }
   });
 })();
 </script>

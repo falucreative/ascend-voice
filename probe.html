@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Voice Probe</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 24px;
+         display: flex; flex-direction: column; align-items: center; gap: 18px;
+         background: #101418; color: #e8edf2; min-height: 100vh; box-sizing: border-box; }
+  h1 { font-size: 20px; margin: 8px 0 0; }
+  #status { font-size: 15px; color: #9fb0c0; text-align: center; min-height: 40px;
+            max-width: 340px; word-break: break-word; }
+  button { font-size: 17px; padding: 14px 28px; border-radius: 999px; border: none;
+           background: #2f6fed; color: #fff; }
+  button:disabled { opacity: .4; }
+  #rec.live { background: #d64545; }
+  canvas { width: 280px; height: 48px; background: #1a2027; border-radius: 8px; }
+  audio { width: 280px; }
+</style>
+</head>
+<body>
+<h1>Voice Probe</h1>
+<p id="status">Tap Record. Your phone should ask to allow the microphone.</p>
+<button id="rec" type="button">&#127908; Record</button>
+<canvas id="meter" width="280" height="48"></canvas>
+<audio id="play" controls></audio>
+<script>
+(function () {
+  var st = document.getElementById('status');
+  var btn = document.getElementById('rec');
+  var player = document.getElementById('play');
+  var rec = null, stream = null, chunks = [];
+  function say(s) { st.textContent = s; }
+  function fail(where, e) { say('FAILED at ' + where + ': ' + (e && e.message ? e.message : e)); }
+
+  // decoration only — the core chain never depends on this (card: AM5)
+  function startMeter(ms) {
+    try {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      var ctx = new AC();                     // created inside the tap gesture
+      if (ctx.state === 'suspended') ctx.resume();
+      var src = ctx.createMediaStreamSource(ms);
+      var an = ctx.createAnalyser(); an.fftSize = 256;
+      src.connect(an);
+      var cv = document.getElementById('meter'), g = cv.getContext('2d');
+      var buf = new Uint8Array(an.frequencyBinCount);
+      (function draw() {
+        if (!stream) return;
+        an.getByteFrequencyData(buf);
+        var v = 0; for (var i = 0; i < buf.length; i++) v = Math.max(v, buf[i]);
+        g.clearRect(0, 0, cv.width, cv.height);
+        g.fillStyle = '#2f6fed';
+        g.fillRect(0, cv.height - (v / 255) * cv.height, cv.width, (v / 255) * cv.height);
+        requestAnimationFrame(draw);
+      })();
+    } catch (e) { /* meter is decoration; the proof does not care */ }
+  }
+
+  btn.addEventListener('click', function () {
+    if (stream) { // stop
+      try { rec.stop(); } catch (e) {}
+      return;
+    }
+    say('Asking for the microphone…');
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      say('This browser has no getUserMedia. The probe cannot run here.'); return;
+    }
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(function (ms) {
+      stream = ms;
+      // the handback smoke signal fires on SUCCESS, guarded (card: AM3/AM5)
+      try {
+        if (window.opener) window.opener.postMessage({ ascendVoice: 'mic-proven' }, '*');
+      } catch (e0) {}
+      var mime = '';
+      try {
+        if (window.MediaRecorder) {
+          if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('audio/mp4')) mime = 'audio/mp4';
+          else if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('audio/webm')) mime = 'audio/webm';
+        } else { fail('MediaRecorder', 'not present in this browser'); return; }
+        rec = mime ? new MediaRecorder(ms, { mimeType: mime }) : new MediaRecorder(ms);
+      } catch (e1) { fail('MediaRecorder setup', e1); return; }
+      chunks = [];
+      rec.ondataavailable = function (ev) { if (ev.data && ev.data.size) chunks.push(ev.data); };
+      rec.onstop = function () {
+        try {
+          var type = rec.mimeType || mime || 'audio/mp4';
+          var blob = new Blob(chunks, { type: type });
+          player.src = URL.createObjectURL(blob);
+          say('Recorded ' + Math.round(blob.size / 1024) + ' KB as ' + type +
+              '. Tap Play below to hear it.');
+        } catch (e2) { fail('playback setup', e2); }
+        ms.getTracks().forEach(function (t) { try { t.stop(); } catch (e3) {} });
+        stream = null; btn.classList.remove('live'); btn.textContent = '🎤 Record';
+      };
+      try { rec.start(); } catch (e4) { fail('start', e4); return; }
+      btn.classList.add('live'); btn.textContent = '⏹ Stop';
+      say('Recording (' + (rec.mimeType || mime || 'default') + ')… speak, then tap Stop.');
+      startMeter(ms);
+    }).catch(function (e) {
+      fail('getUserMedia', e);
+      say(st.textContent + ' — If you tapped Don’t Allow: Safari aA menu → Website Settings → Microphone → Allow, then reload.');
+    });
+  });
+})();
+</script>
+</body>
+</html>
