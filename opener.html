@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Opener Test</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; padding: 24px;
+         background: #101418; color: #e8edf2; }
+  button { font-size: 17px; padding: 12px 24px; border-radius: 999px; border: none;
+           background: #2f6fed; color: #fff; }
+  pre { background: #1a2027; padding: 12px; border-radius: 8px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>Opener test</h1>
+<p>Opens the recorder in a popup and prints any message it sends back.</p>
+<button id="go" type="button">Open recorder</button>
+<pre id="log">(no messages yet)</pre>
+<script>
+(function () {
+  var log = document.getElementById('log');
+  document.getElementById('go').addEventListener('click', function () {
+    window.open('index.html', 'ascendVoiceProbe'); // window.open from JS, no noopener
+  });
+  window.addEventListener('message', function (ev) {
+    if (!ev.data || !ev.data.ascendVoice) return;
+    log.textContent = 'received: ' + JSON.stringify(ev.data) +
+      '\nfrom origin: ' + ev.origin +
+      '\nat ' + new Date().toISOString();
+  });
+})();
+</script>
+</body>
+</html>
