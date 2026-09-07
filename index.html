@@ -55,6 +55,17 @@
   var WSS = frag.w || '';
   var APP_ORIGIN = frag.o || '';
   var TONE = frag.t === '1';
+  // card 275 (2026-09-07): m=sig — VOICE SIGNATURE mode. The page ALSO records the audio it streams
+  // (MediaRecorder) and hands BOTH the transcript and the clip back to the app. The clip never rests
+  // here: it lives in memory for the length of the popup, then goes to the app, then to Drive.
+  var SIG = frag.m === 'sig';
+  var SIG_MAX_MS = 60000, sigRec = null, sigChunks = [], sigMime = '', sigStartedAt = 0, sigStopTimer = null;
+  if (SIG) {
+    document.title = 'Voice signature';
+    document.querySelector('h1').textContent = 'Voice signature';
+    st.textContent = 'Hand the phone to the patient. Tap Record, they say their name and that they agree to today\u2019s visit, then tap Stop. 60 seconds max.';
+    sendBtn.textContent = 'Done \u2014 save to the note';
+  }
   var originOk = /^https:\/\//.test(APP_ORIGIN) &&
     (/\.googleusercontent\.com$/.test(new URL(APP_ORIGIN || 'https://x.invalid').host) ||
      APP_ORIGIN === 'https://script.google.com');
@@ -188,6 +199,7 @@
 
   function stopAll(sendEmpty) {
     running = false;
+    if (SIG) sigStop();
     btn.classList.remove('live'); btn.textContent = '🎤 Record';
     try { if (proc) proc.disconnect(); } catch (e) {}
     try { if (ctx) ctx.close(); } catch (e) {}
@@ -225,6 +237,41 @@
     }, 250);
   }
 
+  // ---------- card 275: the clip ----------
+  function sigStart(ms) {
+    sigChunks = []; sigMime = '';
+    var prefs = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg'];
+    var mime = '';
+    for (var i = 0; i < prefs.length; i++) { if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(prefs[i])) { mime = prefs[i]; break; } }
+    try {
+      sigRec = mime ? new MediaRecorder(ms, { mimeType: mime }) : new MediaRecorder(ms);
+      sigMime = (sigRec.mimeType || mime || 'audio/mp4').split(';')[0];
+      sigRec.ondataavailable = function (e) { if (e.data && e.data.size) sigChunks.push(e.data); };
+      sigRec.start(1000);
+      sigStartedAt = Date.now();
+      sigStopTimer = setTimeout(function () { say('60 seconds reached \u2014 stopping.'); stopAll(true); }, SIG_MAX_MS);
+    } catch (e) { fail('recorder', e); }
+  }
+  function sigStop() {
+    if (sigStopTimer) { clearTimeout(sigStopTimer); sigStopTimer = null; }
+    try { if (sigRec && sigRec.state !== 'inactive') sigRec.stop(); } catch (e) {}
+  }
+  var sigSynthetic = null;
+  function sigStartSynthetic() {
+    // #t=1 in sig mode: a 1.5 s 440 Hz WAV, so the app-side upload/chip/notes path can be proven
+    // on a simulator with no microphone. Never used on a real phone.
+    var n = 24000, buf = new ArrayBuffer(44 + n * 2), dv = new DataView(buf);
+    function w(o, sstr) { for (var i = 0; i < sstr.length; i++) dv.setUint8(o + i, sstr.charCodeAt(i)); }
+    w(0, 'RIFF'); dv.setUint32(4, 36 + n * 2, true); w(8, 'WAVE'); w(12, 'fmt '); dv.setUint32(16, 16, true);
+    dv.setUint16(20, 1, true); dv.setUint16(22, 1, true); dv.setUint32(24, 16000, true); dv.setUint32(28, 32000, true);
+    dv.setUint16(32, 2, true); dv.setUint16(34, 16, true); w(36, 'data'); dv.setUint32(40, n * 2, true);
+    for (var i = 0; i < n; i++) dv.setInt16(44 + i * 2, Math.round(Math.sin(2 * Math.PI * 440 * i / 16000) * 12000), true);
+    sigSynthetic = new Blob([buf], { type: 'audio/wav' }); sigMime = 'audio/wav'; sigStartedAt = Date.now();
+  }
+  function sigBlob() {
+    if (sigSynthetic) return sigSynthetic;
+    return sigChunks.length ? new Blob(sigChunks, { type: sigMime || 'audio/mp4' }) : null;
+  }
   function begin() {
     if (!wsUrlOk()) { say('No valid session in the link — open this from Syd’s mic button.'); return; }
     say(TONE ? 'Tone smoke starting…' : 'Asking for the microphone…');
@@ -233,7 +280,7 @@
     ws.onopen = function () {
       wsOpened = true;
       say(TONE ? 'Connected — streaming tone.' : 'Connected — speak now.');
-      if (TONE) { startTonePump(); return; }
+      if (TONE) { if (SIG) sigStartSynthetic(); startTonePump(); return; }
       navigator.mediaDevices.getUserMedia({ audio: true }).then(function (ms) {
         stream = ms;
         try {
@@ -249,6 +296,7 @@
             framesSent++;
           };
           src.connect(proc); proc.connect(ctx.destination);
+          if (SIG) sigStart(ms);
           running = true;
           btn.classList.add('live'); btn.textContent = '⏹ Stop';
           say('Recording — speak, then tap Stop.');
@@ -268,6 +316,9 @@
         say('Done. Review below, then send or copy.');
         sendBtn.disabled = !channel;
         copyBtn.disabled = false;
+      } else if (SIG && sigBlob()) {
+        say('Recorded (no words were recognised). You can still save the clip.');
+        sendBtn.disabled = !channel;
       } else if (wsOpened && TONE) {
         say('Tone smoke complete: opened, ' + framesSent + ' frames sent, clean close ' + ev3.code + '.');
       } else if (wsOpened) {
@@ -285,6 +336,27 @@
 
   sendBtn.addEventListener('click', function () {
     var text = finals.join(' ').trim();
+    if (SIG) {
+      var blob = sigBlob();
+      if (!blob) { say('No recording yet \u2014 tap Record first.'); return; }
+      if (blob.size > 2 * 1024 * 1024) { say('That recording is too large to save. Try a shorter one.'); return; }
+      var secs = Math.max(1, Math.round((Date.now() - sigStartedAt) / 1000));
+      var fr = new FileReader();
+      fr.onload = function () {
+        var b64 = String(fr.result).split(',')[1] || '';
+        if (channel && window.opener) {
+          try {
+            window.opener.postMessage({ ascendVoice: 'signature', text: text, audio: b64, mime: blob.type || sigMime, seconds: Math.min(secs, 60) }, APP_ORIGIN);
+            say('Saved to the note.');
+            setTimeout(function () { try { window.close(); } catch (e) {} }, 400);
+            return;
+          } catch (e) {}
+        }
+        say('No channel back to the app \u2014 close this and try again from the note.');
+      };
+      fr.readAsDataURL(blob);
+      return;
+    }
     if (!text) return;
     if (channel && window.opener) {
       try {
