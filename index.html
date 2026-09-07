@@ -332,12 +332,20 @@
     // down or the presign is stale, the clip still records (as a WAV from the PCM) and saves with
     // "no words were recognised".
     say('Asking for the microphone\u2026');
+    // iOS Safari: an AudioContext made OUTSIDE the tap (inside the getUserMedia promise) stays
+    // suspended and onaudioprocess never fires \u2014 0 frames reach Transcribe, AWS drops the
+    // stream after 15 s of silence (BadRequestException, measured 2026-09-07). Create + resume it
+    // HERE, synchronously inside the tap, and only then ask for the microphone.
+    try {
+      var AC0 = window.AudioContext || window.webkitAudioContext;
+      ctx = new AC0();
+      if (ctx.state === 'suspended') { try { ctx.resume(); } catch (eR) {} }
+    } catch (eC) { ctx = null; }
     navigator.mediaDevices.getUserMedia({ audio: true }).then(function (ms) {
       stream = ms;
       try {
-        var AC = window.AudioContext || window.webkitAudioContext;
-        ctx = new AC();
-        if (ctx.state === 'suspended') ctx.resume();
+        if (!ctx) { var AC = window.AudioContext || window.webkitAudioContext; ctx = new AC(); }
+        if (ctx.state === 'suspended') { try { ctx.resume(); } catch (eR2) {} }
         var src = ctx.createMediaStreamSource(ms);
         proc = ctx.createScriptProcessor(4096, 1, 1);
         proc.onaudioprocess = function (ev2) {
