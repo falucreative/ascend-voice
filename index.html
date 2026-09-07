@@ -59,6 +59,7 @@
   // (MediaRecorder) and hands BOTH the transcript and the clip back to the app. The clip never rests
   // here: it lives in memory for the length of the popup, then goes to the app, then to Drive.
   var SIG = frag.m === 'sig';
+  var NONCE = String(frag.n || '');   // minted by the app per tap; the handback must carry it
   var SIG_MAX_MS = 60000, sigRec = null, sigChunks = [], sigMime = '', sigStartedAt = 0, sigStopTimer = null;
   var sigPcm = [], sigPcmLen = 0, sigRecState = 'none';   // the 16 kHz PCM already streamed doubles as the clip source
   if (SIG) {
@@ -205,6 +206,9 @@
     try { if (proc) proc.disconnect(); } catch (e) {}
     try { if (ctx) ctx.close(); } catch (e) {}
     if (stream) { stream.getTracks().forEach(function (t) { try { t.stop(); } catch (e) {} }); stream = null; }
+    if (SIG && (!ws || ws.readyState !== 1)) {
+      if (sigBlob()) { say('Recorded (no words were recognised). You can still save the clip.'); sendBtn.disabled = !channel; }
+    }
     if (ws && ws.readyState === 1) {
       if (sendEmpty && !finalized) {
         finalized = true;
@@ -251,6 +255,7 @@
       sigRec.ondataavailable = function (e) { if (e.data && e.data.size) sigChunks.push(e.data); chanEl.textContent = 'channel: connected \u00b7 clip: ' + sigMime + ' \u00b7 ' + sigChunks.length + ' chunk(s)'; };
       sigRec.onstop = function () { sigRecState = 'stopped'; if (sigPendingDone) { sigPendingDone = false; sigFinish(); } };
       sigRec.start(1000);
+      sigMime = String(sigRec.mimeType || mime || sigMime || 'audio/mp4').split(';')[0];   // Safari fills mimeType only after start()
       sigRecState = 'recording';
       sigStopTimer = setTimeout(function () { say('60 seconds reached \u2014 stopping.'); stopAll(true); }, SIG_MAX_MS);
     } catch (e) { sigRecState = 'error'; chanEl.textContent = 'channel: connected \u00b7 clip: from stream (recorder unavailable)'; }
@@ -298,7 +303,7 @@
       var b64 = String(fr.result).split(',')[1] || '';
       if (channel && window.opener) {
         try {
-          window.opener.postMessage({ ascendVoice: 'signature', text: text, audio: b64, mime: blob.type || sigMime || 'audio/wav', seconds: Math.min(secs, 60) }, APP_ORIGIN);
+          window.opener.postMessage({ ascendVoice: 'signature', nonce: NONCE, text: text, audio: b64, mime: blob.type || sigMime || 'audio/wav', seconds: Math.min(secs, 60) }, APP_ORIGIN);
           say('Saved to the note.');
           setTimeout(function () { try { window.close(); } catch (e) {} }, 400);
           return;
@@ -308,8 +313,55 @@
     };
     fr.readAsDataURL(blob);
   }
+  function beginSig() {
+    // Voice signature: the MICROPHONE comes first and the socket is best-effort. If Transcribe is
+    // down or the presign is stale, the clip still records (as a WAV from the PCM) and saves with
+    // "no words were recognised".
+    say('Asking for the microphone\u2026');
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(function (ms) {
+      stream = ms;
+      try {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        ctx = new AC();
+        if (ctx.state === 'suspended') ctx.resume();
+        var src = ctx.createMediaStreamSource(ms);
+        proc = ctx.createScriptProcessor(4096, 1, 1);
+        proc.onaudioprocess = function (ev2) {
+          if (!running) return;
+          var pcm = resampleTo16k(ev2.inputBuffer.getChannelData(0), ctx.sampleRate);
+          if (sigPcmLen < 16000 * 60) { sigPcm.push(pcm); sigPcmLen += pcm.length; }
+          if (ws && ws.readyState === 1) { ws.send(audioEvent(new Uint8Array(pcm.buffer))); framesSent++; }
+        };
+        src.connect(proc); proc.connect(ctx.destination);
+        sigStart(ms);
+        running = true;
+        btn.classList.add('live'); btn.textContent = '\u23f9 Stop';
+        say('Recording \u2014 the patient says their name and that they agree to today\u2019s visit, then tap Stop.');
+      } catch (e) { fail('audio pipeline', e); stopAll(false); return; }
+      if (!wsUrlOk()) { chanEl.textContent = 'channel: connected \u00b7 no transcription session'; return; }
+      try {
+        ws = new WebSocket(WSS);
+        ws.binaryType = 'arraybuffer';
+        ws.onopen = function () { wsOpened = true; };
+        ws.onmessage = handleMessage;
+        ws.onerror = function () { chanEl.textContent = 'channel: connected \u00b7 transcription unavailable (clip still recording)'; };
+        ws.onclose = function () {
+          if (partial) { finals.push(partial); partial = ''; render(); }
+          if (running) return;   // closed early: keep recording the clip
+          say(finals.length ? 'Done. Review the words below, then tap Done to save.' : 'Recorded (no words were recognised). You can still save the clip.');
+          sendBtn.disabled = !channel;
+          copyBtn.disabled = !finals.length;
+        };
+      } catch (e) { ws = null; chanEl.textContent = 'channel: connected \u00b7 transcription unavailable (clip still recording)'; }
+    }).catch(function (e) {
+      fail('getUserMedia', e);
+      say(st.textContent + ' \u2014 If you tapped Don\u2019t Allow: Safari aA menu \u2192 Website Settings \u2192 Microphone \u2192 Allow, then reload.');
+      stopAll(false);
+    });
+  }
   function begin() {
-    if (!wsUrlOk()) { say('No valid session in the link — open this from Syd’s mic button.'); return; }
+    if (SIG && !TONE) { beginSig(); return; }
+    if (!wsUrlOk()) { say(SIG ? 'No valid session in the link \u2014 open this from the Voice signature button in the note.' : 'No valid session in the link — open this from Syd’s mic button.'); return; }
     say(TONE ? 'Tone smoke starting…' : 'Asking for the microphone…');
     ws = new WebSocket(WSS);
     ws.binaryType = 'arraybuffer';
@@ -345,7 +397,7 @@
       });
     };
     ws.onmessage = handleMessage;
-    ws.onerror = function () { if (!wsOpened) say('Could not connect (the session may have expired — reopen from Syd).'); };
+    ws.onerror = function () { if (!wsOpened) say(SIG ? 'Could not reach the transcription service \u2014 the clip is still being recorded; tap Stop when done.' : 'Could not connect (the session may have expired — reopen from Syd).'); };
     ws.onclose = function (ev3) {
       if (running) { running = false; btn.classList.remove('live'); btn.textContent = '🎤 Record'; }
       if (finals.length || partial) {
