@@ -30,6 +30,7 @@
 <p id="status">Tap Record and speak. Your words appear below as you talk.</p>
 <button id="rec" type="button">&#127908; Record</button>
 <div id="out"></div>
+<audio id="play" controls class="hidden" style="width:100%;max-width:420px;display:none"></audio>
 <div class="row">
   <button id="send" type="button" disabled>Done &#8212; send to Syd</button>
   <button id="copy" type="button" disabled>Copy</button>
@@ -215,7 +216,7 @@
     try { if (ctx) ctx.close(); } catch (e) {}
     if (stream) { stream.getTracks().forEach(function (t) { try { t.stop(); } catch (e) {} }); stream = null; }
     if (SIG && (!ws || ws.readyState !== 1)) {
-      if (sigBlob()) { say('Recorded (no words were recognised). You can still save the clip.'); sendBtn.disabled = !channel; }
+      if (sigBlob()) { say('Recorded (no words were recognised). Play it back below, then save.'); sendBtn.disabled = !channel; setTimeout(sigOfferPlayback, 300); }
     }
     if (ws && ws.readyState === 1) {
       if (sendEmpty && !finalized) {
@@ -261,7 +262,7 @@
       sigRec = mime ? new MediaRecorder(ms, { mimeType: mime }) : new MediaRecorder(ms);
       sigMime = (sigRec.mimeType || mime || 'audio/mp4').split(';')[0];
       sigRec.ondataavailable = function (e) { if (e.data && e.data.size) sigChunks.push(e.data); chanEl.textContent = 'channel: connected \u00b7 clip: ' + sigMime + ' \u00b7 ' + sigChunks.length + ' chunk(s)'; };
-      sigRec.onstop = function () { sigRecState = 'stopped'; if (sigPendingDone) { sigPendingDone = false; sigFinish(); } };
+      sigRec.onstop = function () { sigRecState = 'stopped'; sigOfferPlayback(); if (sigPendingDone) { sigPendingDone = false; sigFinish(); } };
       sigRec.start(1000);
       sigMime = String(sigRec.mimeType || mime || sigMime || 'audio/mp4').split(';')[0];   // Safari fills mimeType only after start()
       sigRecState = 'recording';
@@ -298,6 +299,11 @@
     if (sigSynthetic) return sigSynthetic;
     if (sigChunks.length) return new Blob(sigChunks, { type: sigMime || 'audio/mp4' });
     return pcmToWav();   // no MediaRecorder, or it delivered nothing: the streamed PCM is the clip
+  }
+  function sigOfferPlayback() {
+    var b = sigBlob(); if (!b) return;
+    var a = document.getElementById('play');
+    try { a.src = URL.createObjectURL(b); a.style.display = 'block'; } catch (e) {}
   }
   var sigPendingDone = false;
   function sigFinish() {
@@ -414,8 +420,8 @@
         sendBtn.disabled = !channel;
         copyBtn.disabled = false;
       } else if (SIG && sigBlob()) {
-        say('Recorded (no words were recognised). You can still save the clip.');
-        sendBtn.disabled = !channel;
+        say('Recorded (no words were recognised). Play it back below, then save.');
+        sendBtn.disabled = !channel; setTimeout(sigOfferPlayback, 300);
       } else if (wsOpened && TONE) {
         say('Tone smoke complete: opened, ' + framesSent + ' frames sent, clean close ' + ev3.code + '.');
       } else if (wsOpened) {
