@@ -186,7 +186,7 @@
       if (SIG) {
         // Voice signature (2026-09-07, Falú's phone): a transcription rejection must NEVER stop
         // the clip. Drop the socket, keep recording, say so in the channel line.
-        chanEl.textContent = 'channel: connected \u00b7 transcription unavailable (' + String(msg.headers[':exception-type'] || 'exception').slice(0, 40) + ') \u2014 clip still recording';
+        chanEl.textContent = 'channel: connected \u00b7 transcription unavailable (' + String(msg.headers[':exception-type'] || 'exception').slice(0, 40) + (detail ? ': ' + detail.slice(0, 140) : '') + ') \u00b7 ' + framesSent + ' frame(s) sent \u2014 clip still recording';
         try { ws.close(); } catch (e9) {}
         ws = null;
         return;
